@@ -1,235 +1,182 @@
 ## Overview
-Build a strict TypeScript Space Invaders MVP on the constitution stack: `pnpm` for package management, Vite for the browser bundle, Vitest for game-logic tests, ESLint for static checks, and a raw HTML canvas entrypoint for play. The implementation should produce a static bundle that runs from `file://` or any static host, expose a small public TypeScript API for embedding the game into a page, and keep gameplay logic deterministic and testable by separating the pure simulation from rendering, audio, input, and asset-loading adapters.
+Stand up the test and lint toolchain required by the constitution's Stack so that `pnpm vitest run` and `pnpm eslint .` pass cleanly before any gameplay code is written. This plan adds a Vitest configuration wired for a browser-like DOM environment, a flat ESLint config using `typescript-eslint`'s recommended-type-checked rules, and a single smoke test that proves the harness executes TypeScript tests. The result is a CI-ready foundation that enforces the "Fail loud in dev" principle from day one and leaves all gameplay decisions from the earlier project plan untouched.
 
 ## Architecture
-The project should be split into a thin browser shell and a pure core. `src/main.ts` mounts the default browser experience into `index.html`, while `src/index.ts` exports the public library API. The public factory creates a game instance around a provided canvas element, validates configuration, loads bundled assets, wires keyboard input, then starts a fixed-timestep simulation loop backed by `requestAnimationFrame`.
+Three cooperating config surfaces live at the repo root and are consumed by their respective CLIs when a contributor runs the commands declared in `CONSTITUTION.md`.
 
-Core data should flow in one direction each frame: keyboard state is sampled into an input snapshot, the simulation updates the immutable-ish game state using a fixed delta, the simulation emits domain events, and adapter layers consume that state to render sprites, update HUD text, and trigger Web Audio playback. Rendering stays on raw Canvas 2D for the first MVP cut, with renderer boundaries left clean enough to swap or extend later if a WebGL path is needed. Asset loading should use Vite-bundled local URLs rather than remote fetches so the built game remains compatible with `file://`.
+- `vitest.config.ts` is read by the Vitest runner. It selects a DOM-capable test environment (`jsdom`) so future game-logic tests that touch `HTMLCanvasElement`, `KeyboardEvent`, or `AudioContext` typing have the expected globals. It sets `include` to match `src/**/*.test.ts` and `tests/**/*.test.ts`, and enables TypeScript source imports without a build step.
+- `eslint.config.js` is read by ESLint v9's flat config loader. It composes `@eslint/js` recommended rules with `typescript-eslint`'s `recommendedTypeChecked` preset, scoped to `**/*.ts` and `**/*.tsx`. It ignores build artifacts (`dist/`, `coverage/`, `node_modules/`) and config files that don't need type-aware linting. Parser options point at `tsconfig.json` so rules that need type information work.
+- `tsconfig.json` continues to own strict TypeScript, and is referenced by both configs via `projectService` (ESLint) and Vitest's built-in TS loader. No duplicate type settings live in the lint or test config.
+
+Data flow per contributor command:
+
+1. `pnpm vitest run` → Vitest loads `vitest.config.ts` → discovers `src/smoke.test.ts` → runs under jsdom → reports pass/fail.
+2. `pnpm eslint .` → ESLint loads `eslint.config.js` → walks `src/` and `tests/` → reports zero errors on the committed baseline.
+3. `pnpm tsc --noEmit` continues to enforce strict typing across test and config files where applicable (test files are picked up via `include` in `tsconfig.json`).
 
 ## User experience
-Public API exports should be limited to `src/index.ts`; everything else is internal and may change without a major version bump.
+This proposal is consumed by contributors, not library end users. The "public surface" is the set of root-level config files plus the commands in `CONSTITUTION.md`. Gameplay library exports remain as defined in the broader project plan; this task does not add or remove any library exports.
 
-Proposed public exports:
-
-```ts
-export type SpaceInvadersStatus =
-  | "idle"
-  | "loading"
-  | "running"
-  | "game-over"
-  | "destroyed";
-
-export type AssetId =
-  | "player"
-  | "invader-a"
-  | "invader-b"
-  | "invader-c"
-  | "projectile"
-  | "shoot"
-  | "hit"
-  | "explosion"
-  | "bg-loop";
-
-export interface SpaceInvadersAssets {
-  readonly sprites?: Partial<Record<Exclude<AssetId, "shoot" | "hit" | "explosion" | "bg-loop">, string>>;
-  readonly audio?: Partial<Record<Extract<AssetId, "shoot" | "hit" | "explosion" | "bg-loop">, string>>;
-}
-
-export interface SpaceInvadersOptions {
-  readonly canvas: HTMLCanvasElement;
-  readonly width?: number;
-  readonly height?: number;
-  readonly pixelRatio?: number;
-  readonly autoStart?: boolean;
-  readonly muted?: boolean;
-  readonly assetBaseUrl?: string;
-  readonly assets?: SpaceInvadersAssets;
-  readonly onEvent?: (event: SpaceInvadersEvent) => void;
-}
-
-export interface SpaceInvadersHandle {
-  start(): Promise<void>;
-  restart(): void;
-  resize(width: number, height: number, pixelRatio?: number): void;
-  setMuted(muted: boolean): void;
-  getSnapshot(): Readonly<GameSnapshot>;
-  destroy(): void;
-}
-
-export interface GameSnapshot {
-  readonly status: SpaceInvadersStatus;
-  readonly score: number;
-  readonly wave: number;
-  readonly lives: number;
-  readonly enemiesRemaining: number;
-}
-
-export type SpaceInvadersEvent =
-  | { readonly type: "ready" }
-  | { readonly type: "score-changed"; readonly score: number }
-  | { readonly type: "wave-started"; readonly wave: number }
-  | { readonly type: "player-hit"; readonly livesRemaining: number }
-  | { readonly type: "game-over"; readonly finalScore: number }
-  | { readonly type: "warning"; readonly error: SpaceInvadersError };
-
-export type SpaceInvadersError =
-  | {
-      readonly kind: "invalid-config";
-      readonly message: string;
-      readonly field: keyof SpaceInvadersOptions;
-    }
-  | {
-      readonly kind: "unsupported-browser";
-      readonly message: string;
-      readonly feature: "canvas-2d" | "webaudio";
-    }
-  | {
-      readonly kind: "asset-load-failed";
-      readonly message: string;
-      readonly assetId: AssetId;
-    };
-
-export declare function createSpaceInvaders(
-  options: SpaceInvadersOptions,
-): Promise<SpaceInvadersHandle>;
-
-export declare function isSpaceInvadersError(
-  value: unknown,
-): value is SpaceInvadersError;
-```
-
-Usage snippet: basic browser mount.
+Configuration-level types and signatures contributors interact with:
 
 ```ts
-import { createSpaceInvaders } from "space-invaders";
+// vitest.config.ts
+import { defineConfig } from "vitest/config";
 
-const canvas = document.querySelector("canvas");
-
-if (!(canvas instanceof HTMLCanvasElement)) {
-  throw new Error("Canvas element not found");
-}
-
-const game = await createSpaceInvaders({ canvas, autoStart: true });
-```
-
-Usage snippet: host-controlled restart and HUD sync.
-
-```ts
-import { createSpaceInvaders } from "space-invaders";
-
-const game = await createSpaceInvaders({
-  canvas,
-  onEvent(event) {
-    if (event.type === "score-changed") scoreNode.textContent = String(event.score);
-    if (event.type === "game-over") overlay.hidden = false;
-  },
-});
-
-restartButton.addEventListener("click", () => {
-  overlay.hidden = true;
-  game.restart();
-});
-```
-
-Usage snippet: local asset overrides with muted audio.
-
-```ts
-import { createSpaceInvaders } from "space-invaders";
-
-await createSpaceInvaders({
-  canvas,
-  muted: true,
-  assetBaseUrl: "./assets",
-  assets: {
-    sprites: { player: "./assets/player.png" },
-    audio: { shoot: "./assets/shoot.wav" },
+export default defineConfig({
+  test: {
+    environment: "jsdom",
+    include: ["src/**/*.test.ts", "tests/**/*.test.ts"],
+    globals: false,
+    reporters: "default",
   },
 });
 ```
 
-Invalid configuration should reject `createSpaceInvaders` with `invalid-config`. Unsupported platform features should reject startup with `unsupported-browser`. Asset failures should reject in development; in production they should emit a `warning` event and fall back to playable defaults where possible, such as silent audio or generated placeholder sprites. Side effects must be explicit: the library owns a `requestAnimationFrame` loop, attaches keyboard listeners, reads bundled asset URLs, draws into the provided canvas, and creates browser audio resources. No network, filesystem, backend, analytics, or global persistence side effects are in MVP.
+```js
+// eslint.config.js (flat config)
+import js from "@eslint/js";
+import tseslint from "typescript-eslint";
+
+export default tseslint.config(
+  { ignores: ["dist/**", "coverage/**", "node_modules/**"] },
+  js.configs.recommended,
+  ...tseslint.configs.recommendedTypeChecked,
+  {
+    files: ["**/*.ts"],
+    languageOptions: {
+      parserOptions: {
+        projectService: true,
+        tsconfigRootDir: import.meta.dirname,
+      },
+    },
+  },
+);
+```
+
+```ts
+// src/smoke.test.ts
+import { describe, it, expect } from "vitest";
+
+describe("smoke", () => {
+  it("runs arithmetic under the test harness", () => {
+    expect(1 + 1).toBe(2);
+  });
+});
+```
+
+Realistic contributor usage — first-time setup:
+
+```sh
+pnpm install
+pnpm vitest run    # expects: 1 passed (src/smoke.test.ts)
+pnpm eslint .      # expects: zero errors, zero warnings
+pnpm tsc --noEmit  # still passes once src/ has real code
+```
+
+Realistic contributor usage — adding a new game-logic test later:
+
+```ts
+// src/core/collision.test.ts
+import { describe, it, expect } from "vitest";
+import { collides } from "./collision";
+
+describe("collides", () => {
+  it("detects overlapping AABBs", () => {
+    expect(collides({ x: 0, y: 0, w: 10, h: 10 }, { x: 5, y: 5, w: 10, h: 10 })).toBe(true);
+  });
+});
+```
+
+Realistic contributor usage — running a single test file:
+
+```sh
+pnpm vitest run src/smoke.test.ts
+```
+
+Error/result shape:
+
+- `pnpm vitest run` exits non-zero on any failing `expect` or uncaught error, printing the failed assertion and stack trace.
+- `pnpm eslint .` exits non-zero if any rule reports an error; warnings do not fail the command unless `--max-warnings 0` is added later.
+- Invalid config shapes surface as Vitest or ESLint startup errors (module load failure) rather than silent misbehavior — matching "Fail loud in dev".
+
+Internal vs public: none of the files added by this task are importable library APIs. They are toolchain configuration and an internal smoke test. They may change without a semver bump.
+
+Side effects: ESLint and Vitest both read files from the working tree; neither touches the network, and no new runtime side effects are introduced into shipped code.
 
 ## File tree
+Files this plan creates or modifies:
+
 ```text
 .
-├── ASSETS.md
-├── index.html
-├── package.json
-├── pnpm-lock.yaml
-├── tsconfig.json
-├── tsconfig.node.json
-├── vite.config.ts
-├── eslint.config.js
-├── public/
-│   └── favicon.svg
-├── src/
-│   ├── index.ts
-│   ├── main.ts
-│   ├── game/
-│   │   ├── createSpaceInvaders.ts
-│   │   ├── gameLoop.ts
-│   │   ├── types.ts
-│   │   └── errors.ts
-│   ├── core/
-│   │   ├── initialState.ts
-│   │   ├── updateSimulation.ts
-│   │   ├── collision.ts
-│   │   ├── waveProgression.ts
-│   │   └── scoring.ts
-│   ├── input/
-│   │   └── keyboard.ts
-│   ├── render/
-│   │   ├── canvasRenderer.ts
-│   │   └── spriteAtlas.ts
-│   ├── audio/
-│   │   └── webAudio.ts
-│   ├── assets/
-│   │   ├── manifest.ts
-│   │   └── placeholders.ts
-│   └── ui/
-│       └── hud.ts
-└── tests/
-    ├── collision.test.ts
-    ├── waveProgression.test.ts
-    ├── scoring.test.ts
-    └── createSpaceInvaders.test.ts
+├── package.json          (modify — add devDependencies + scripts if missing)
+├── vitest.config.ts      (create)
+├── eslint.config.js      (create)
+├── tsconfig.json         (modify only if needed to include src/**/*.test.ts)
+└── src/
+    └── smoke.test.ts     (create)
 ```
 
+No other files are touched by this task. The gameplay source files listed in the broader project plan (`src/index.ts`, `src/main.ts`, `src/core/**`, etc.) are out of scope here and will be added by later tasks.
+
 ## Dependencies
-- Runtime dependencies: none beyond the browser platform APIs already allowed by the constitution (`CanvasRenderingContext2D`, `requestAnimationFrame`, `KeyboardEvent`, `AudioContext`).
-- Dev dependencies: `typescript`, `vite`, `vitest`, `eslint`, `@typescript-eslint/parser`, `@typescript-eslint/eslint-plugin`, `@types/node`.
-- Package manager and commands must remain the constitution values: `pnpm install`, `pnpm vitest run`, `pnpm eslint .`, `pnpm tsc --noEmit`, `pnpm build`.
-- No game engine or other runtime library should be introduced unless the constitution is amended first.
+All new additions go into `devDependencies` only. No runtime dependencies are introduced, preserving the constitution's Boundaries.
+
+- `typescript` — required by ESLint type-aware rules and by `pnpm tsc --noEmit`.
+- `vitest` — test runner matching the constitution's declared `pnpm vitest run` command.
+- `jsdom` — DOM environment used by Vitest so tests can reference `HTMLCanvasElement`, `KeyboardEvent`, and similar browser types without importing a full browser.
+- `eslint` (v9+) — flat-config-capable ESLint matching `pnpm eslint .`.
+- `typescript-eslint` (meta package exposing `tseslint.config`, parser, and plugin) — provides `recommendedTypeChecked`.
+- `@eslint/js` — provides `js.configs.recommended` for the flat config composition.
+- `@types/node` — types for `import.meta.dirname` in `eslint.config.js` and for any Node-ish test helpers.
+
+Scripts in `package.json` should mirror the constitution's commands so `pnpm test`, `pnpm lint`, and `pnpm typecheck` are idiomatic shortcuts to `vitest run`, `eslint .`, and `tsc --noEmit` respectively. The constitution's exact commands (`pnpm vitest run`, `pnpm eslint .`, `pnpm tsc --noEmit`, `pnpm build`) remain the canonical ones.
 
 ## Data model
-- `GameState`: `{ status, score, wave, lives, tick, player, invaders, projectiles, cooldowns, rngSeed }`.
-- `PlayerState`: `{ x, y, width, height, speed, alive, shotCooldownMs }`.
-- `InvaderState`: `{ id, row, column, x, y, width, height, alive, sprite: "invader-a" | "invader-b" | "invader-c" }`.
-- `ProjectileState`: `{ id, owner: "player" | "invader", x, y, width, height, velocityY, active }`.
-- `WaveState`: `{ index, direction: -1 | 1, horizontalSpeed, descentStep, stepIntervalMs, enemiesRemaining }`.
-- `InputState`: `{ leftPressed, rightPressed, firePressed }`.
-- `AssetManifest`: maps sprite and audio IDs to bundled local URLs plus metadata needed by loaders.
-- `SimulationResult`: `{ state: GameState, events: readonly SpaceInvadersEvent[] }`.
-- `SpaceInvadersError`: discriminated union for startup and asset failures; no untyped throw payloads.
+This task introduces configuration shapes rather than runtime types, but the relevant interfaces are:
+
+- `VitestUserConfig` (from `vitest/config`):
+  - `test.environment: "jsdom"`
+  - `test.include: readonly string[]` — `["src/**/*.test.ts", "tests/**/*.test.ts"]`
+  - `test.globals: false` — tests must import `describe`/`it`/`expect` from `vitest` to keep surface explicit and typed.
+  - `test.reporters: "default"`
+- `FlatESLintConfig` (from `typescript-eslint`):
+  - `ignores: readonly string[]` — `dist/**`, `coverage/**`, `node_modules/**`.
+  - `files: readonly string[]` — `**/*.ts`.
+  - `languageOptions.parserOptions`: `{ projectService: true, tsconfigRootDir: string }`.
+  - Composition: `js.configs.recommended` ∘ `tseslint.configs.recommendedTypeChecked`.
+- `SmokeTest`: a single `describe` block with one `it` asserting `1 + 1 === 2` via `expect().toBe()`.
+- `PackageJsonDevDeps`: a `Record<string, string>` additions listed in Dependencies.
+
+No new runtime types are added. Game-logic types (`GameState`, `PlayerState`, etc.) stay out of this task's scope.
 
 ## Implementation phases
-1. Scaffold the toolchain and browser shell: add `package.json`, `pnpm-lock.yaml`, TypeScript config, Vite config, ESLint config, `index.html`, and a minimal `src/main.ts`/`src/index.ts` split that proves the canvas entrypoint and exported API shape.
-2. Define the public and internal contracts: add the exported types, error union, game handle interface, asset manifest types, and pure state model so later work has stable boundaries.
-3. Implement deterministic core simulation: fixed-timestep update loop, keyboard input sampling, player movement, projectile spawning, invader marching, collision detection, scoring, wave progression, and game-over transitions in pure modules covered by Vitest.
-4. Add platform adapters: canvas renderer for sprites and HUD, asset loader with placeholder fallback behavior, and Web Audio playback for shoot/hit/explosion/background loop behind explicit browser capability checks.
-5. Wire the playable browser flow: startup, resize behavior, restart flow, score display, game-over overlay/state, and event emission so the default Vite page and external consumers both exercise the same API.
-6. Harden and verify: populate `ASSETS.md`, add tests for factory validation and core game rules, run `pnpm vitest run`, `pnpm eslint .`, `pnpm tsc --noEmit`, and `pnpm build`, then perform a manual `file://` smoke test and dev HUD frame-timing check.
+Ordered smallest-to-largest; each phase leaves the repo in a runnable state.
+
+1. **Add devDependencies and scripts.** Update `package.json` to declare `typescript`, `vitest`, `jsdom`, `eslint`, `typescript-eslint`, `@eslint/js`, and `@types/node` under `devDependencies`. Add `test`, `lint`, `typecheck` script aliases matching the constitution's commands. Run `pnpm install` to lock versions.
+2. **Write the smoke test.** Create `src/smoke.test.ts` with a single `describe`/`it` that asserts `expect(1 + 1).toBe(2)`. Imports come from `vitest` directly so `globals: false` works.
+3. **Author `vitest.config.ts`.** Use `defineConfig` from `vitest/config`, select `jsdom`, set `include` to `src/**/*.test.ts` and `tests/**/*.test.ts`, keep `globals: false`. Confirm `pnpm vitest run` finds and passes the smoke test.
+4. **Author `eslint.config.js`.** Use the `typescript-eslint` flat-config helper to compose `@eslint/js` recommended with `tseslint.configs.recommendedTypeChecked`. Ignore `dist/`, `coverage/`, `node_modules/`. Point `parserOptions.projectService` at the repo's `tsconfig.json`. Confirm `pnpm eslint .` reports zero errors on the smoke test and the config files themselves.
+5. **Ensure `tsconfig.json` covers tests.** Only modify if the current `include` doesn't already pick up `src/**/*.test.ts`; otherwise leave it alone. Confirm `pnpm tsc --noEmit` still passes.
+6. **Verify the full gate locally.** Run `pnpm install`, `pnpm vitest run`, `pnpm eslint .`, and `pnpm tsc --noEmit` in sequence; all four must exit zero before the task is complete.
 
 ## Acceptance criteria
-- `pnpm install`, `pnpm vitest run`, `pnpm eslint .`, `pnpm tsc --noEmit`, and `pnpm build` all succeed on the committed scaffold and MVP implementation.
-- Opening the built output in a modern browser from `file://` or a static host shows a working canvas-based Space Invaders game with keyboard movement, shooting, collisions, score updates, wave advancement, game over, and restart.
-- The exported TypeScript API is limited to the planned public surface, has no `any` types, and cleanly reports invalid config, unsupported-browser, and asset-load errors.
-- Game-logic tests cover collision outcomes, scoring changes, and wave progression, proving the deterministic core independently of rendering.
-- Rendering uses raw Canvas rather than a third-party engine, audio uses browser APIs only, and the runtime dependency list remains empty.
-- Licensed asset provenance is documented in `ASSETS.md`, and missing assets degrade gracefully enough to keep the game playable in production builds.
+A reviewer can accept this MVP when all of the following hold:
+
+- `pnpm install` succeeds from a clean clone using the committed `pnpm-lock.yaml`.
+- `pnpm vitest run` exits zero and reports exactly one passing test from `src/smoke.test.ts` asserting `1 + 1 === 2`.
+- `pnpm eslint .` exits zero with no errors and no warnings on the committed files.
+- `pnpm tsc --noEmit` continues to exit zero with `strict: true`.
+- `vitest.config.ts` exists at the repo root, uses `defineConfig` from `vitest/config`, and selects a DOM-capable environment (`jsdom`).
+- `eslint.config.js` exists at the repo root as a flat config and composes `@eslint/js` recommended with `typescript-eslint`'s `recommendedTypeChecked` preset.
+- `package.json` lists `vitest`, `eslint`, `typescript-eslint`, `@eslint/js`, `jsdom`, `@types/node`, and `typescript` under `devDependencies` only (no runtime deps added).
+- No `any` types and no TypeScript or ESLint suppression comments are introduced anywhere in the added files.
+- Gameplay source files and their public API are untouched by this task.
 
 ## Open questions
-- Is Canvas 2D alone acceptable for MVP, with renderer abstraction kept ready for a later WebGL path, or is a dual Canvas/WebGL implementation expected immediately?
-- What concrete sprite and audio assets are available today, and can placeholder art/audio ship in the first playable cut as long as `ASSETS.md` records provenance?
-- What viewport and aspect ratio should define the default playfield for the browser shell: original arcade proportions, a fixed 4:3 canvas, or a wider modern presentation?
-- Should audio remain muted until the first user gesture to satisfy browser autoplay rules, or is an explicit start button preferred for the default host page?
+- Should the Vitest environment be `jsdom` or `happy-dom`? `jsdom` is more compatible with browser-grade DOM APIs the game will eventually exercise, but `happy-dom` is faster; the proposal allows either and the choice affects CI wall time.
+- Should `pnpm lint` use `--max-warnings 0` immediately, or wait until after gameplay code lands and baseline noise is understood?
+- Is `recommendedTypeChecked` the right starting preset, or should the project start with the non-type-checked `recommended` and layer type-aware rules later to minimize initial lint load?
+- Should coverage (`@vitest/coverage-v8`) be wired up as part of this initial toolchain task, or deferred until gameplay tests exist and a meaningful coverage baseline can be set?
+- Does the repo need a `tests/` top-level directory today, or should all tests co-locate next to source under `src/**` until a second test location is actually required?
+- What minimum Node.js version should contributors target? ESLint v9 flat config and `typescript-eslint` v8 both require Node 18.18+, which should be pinned in `package.json` `engines` if adopted.
